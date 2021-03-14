@@ -12,6 +12,7 @@ use std::net::TcpStream;
 use native_tls_crate::TlsStream;
 #[cfg(feature = "rustls-tls")]
 use rustls::StreamOwned;
+use socks::Socks5Stream;
 
 /// Stream mode, either plain TCP or TLS.
 #[derive(Clone, Copy, Debug)]
@@ -31,6 +32,12 @@ pub trait NoDelay {
 impl NoDelay for TcpStream {
     fn set_nodelay(&mut self, nodelay: bool) -> IoResult<()> {
         TcpStream::set_nodelay(self, nodelay)
+    }
+}
+
+impl NoDelay for Socks5Stream {
+    fn set_nodelay(&mut self, nodelay: bool) -> IoResult<()> {
+        TcpStream::set_nodelay(self.get_mut(), nodelay)
     }
 }
 

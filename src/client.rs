@@ -20,16 +20,41 @@ use crate::{
 mod encryption {
     pub use native_tls_crate::TlsStream;
     use native_tls_crate::{HandshakeError as TlsHandshakeError, TlsConnector};
+    use socks::Socks5Stream;
     use std::net::TcpStream;
 
     pub use crate::stream::Stream as StreamSwitcher;
     /// TCP stream switcher (plain/TLS).
     pub type AutoStream = StreamSwitcher<TcpStream, TlsStream<TcpStream>>;
+    /// Sock5 stream wrapper
+    pub type ProxyAutoStream = StreamSwitcher<Socks5Stream, TlsStream<Socks5Stream>>;
 
     use crate::{
         error::{Result, TlsError},
         stream::Mode,
     };
+
+    pub fn wrap_proxy_stream(
+        stream: Socks5Stream,
+        domain: &str,
+        mode: Mode,
+    ) -> Result<ProxyAutoStream> {
+        match mode {
+            Mode::Plain => Ok(StreamSwitcher::Plain(stream)),
+            Mode::Tls => {
+                let connector = TlsConnector::builder().build().map_err(TlsError::Native)?;
+                connector
+                    .connect(domain, stream)
+                    .map_err(|e| match e {
+                        TlsHandshakeError::Failure(f) => TlsError::Native(f).into(),
+                        TlsHandshakeError::WouldBlock(_) => {
+                            panic!("Bug: TLS handshake not blocked")
+                        }
+                    })
+                    .map(StreamSwitcher::Tls)
+            }
+        }
+    }
 
     pub fn wrap_stream(stream: TcpStream, domain: &str, mode: Mode) -> Result<AutoStream> {
         match mode {
@@ -54,17 +79,42 @@ mod encryption {
 mod encryption {
     use rustls::ClientConfig;
     pub use rustls::{ClientSession, StreamOwned};
+    use socks::Socks5Stream;
     use std::{net::TcpStream, sync::Arc};
     use webpki::DNSNameRef;
 
     pub use crate::stream::Stream as StreamSwitcher;
     /// TCP stream switcher (plain/TLS).
     pub type AutoStream = StreamSwitcher<TcpStream, StreamOwned<ClientSession, TcpStream>>;
+    /// Sock5 stream wrapper
+    pub type ProxyAutoStream = StreamSwitcher<Socks5Stream, TlsStream<Socks5Stream>>;
 
     use crate::{
         error::{Result, TlsError},
         stream::Mode,
     };
+
+    pub fn wrap_proxy_stream(
+        stream: Socks5Stream,
+        domain: &str,
+        mode: Mode,
+    ) -> Result<ProxyAutoStream> {
+        match mode {
+            Mode::Plain => Ok(StreamSwitcher::Plain(stream)),
+            Mode::Tls => {
+                let connector = TlsConnector::builder().build().map_err(TlsError::Native)?;
+                connector
+                    .connect(domain, stream)
+                    .map_err(|e| match e {
+                        TlsHandshakeError::Failure(f) => TlsError::Native(f).into(),
+                        TlsHandshakeError::WouldBlock(_) => {
+                            panic!("Bug: TLS handshake not blocked")
+                        }
+                    })
+                    .map(StreamSwitcher::Tls)
+            }
+        }
+    }
 
     pub fn wrap_stream(stream: TcpStream, domain: &str, mode: Mode) -> Result<AutoStream> {
         match mode {
@@ -88,6 +138,7 @@ mod encryption {
 
 #[cfg(not(any(feature = "native-tls", feature = "rustls-tls")))]
 mod encryption {
+    use socks::Socks5Stream;
     use std::net::TcpStream;
 
     use crate::{
@@ -97,6 +148,15 @@ mod encryption {
 
     /// TLS support is not compiled in, this is just standard `TcpStream`.
     pub type AutoStream = TcpStream;
+    /// Sock5 stream wrapper
+    pub type ProxyAutoStream = Socks5Stream;
+
+    pub fn wrap_stream(stream: Sock5Stream, _domain: &str, mode: Mode) -> Result<ProxyAutoStream> {
+        match mode {
+            Mode::Plain => Ok(stream),
+            Mode::Tls => Err(Error::Url(UrlError::TlsFeatureNotEnabled)),
+        }
+    }
 
     pub fn wrap_stream(stream: TcpStream, _domain: &str, mode: Mode) -> Result<AutoStream> {
         match mode {
@@ -107,7 +167,7 @@ mod encryption {
 }
 
 use self::encryption::wrap_stream;
-pub use self::encryption::AutoStream;
+pub use self::encryption::{AutoStream, ProxyAutoStream};
 
 use crate::{
     error::{Error, Result, UrlError},
@@ -187,6 +247,76 @@ pub fn connect_with_config<Req: IntoClientRequest>(
     unreachable!("Bug in a redirect handling logic")
 }
 
+/// Connect to the given WebSocket in blocking mode via sock5 proxy.
+///
+/// The URL may be either ws:// or wss://.
+/// To support wss:// URLs, feature `native-tls` or `rustls-tls` must be turned on.
+///
+/// This function "just works" for those who wants a simple blocking solution
+/// similar to `std::net::TcpStream`. If you want a non-blocking or other
+/// custom stream, call `client` instead.
+///
+/// This function uses `native_tls` or `rustls` to do TLS depending on the feature flags enabled. If
+/// you want to use other TLS libraries, use `client` instead. There is no need to enable any of
+/// the `*-tls` features if you don't call `connect` since it's the only function that uses them.
+pub fn connect_with_proxy<Req: IntoClientRequest>(
+    request: Req,
+    proxy: std::net::SocketAddr,
+    config: Option<WebSocketConfig>,
+    max_redirects: u8,
+) -> Result<(WebSocket<encryption::ProxyAutoStream>, Response)> {
+    fn try_client_handshake(
+        request: Request,
+        proxy: &SocketAddr,
+        config: Option<WebSocketConfig>,
+    ) -> Result<(WebSocket<encryption::ProxyAutoStream>, Response)> {
+        let uri = request.uri();
+        let mode = uri_mode(uri)?;
+        let host = request.uri().host().ok_or(Error::Url(UrlError::NoHostName))?;
+        let port = request.uri().port_u16().unwrap_or_else(|| match mode {
+            Mode::Plain => 80,
+            Mode::Tls => 443,
+        });
+        let addrs = (host, port).to_socket_addrs()?;
+        let mut stream = connect_to_proxy(addrs.as_slice(), proxy, &request.uri(), mode)?;
+        NoDelay::set_nodelay(&mut stream, true)?;
+        client_with_config(request, stream, config).map_err(|e| match e {
+            HandshakeError::Failure(f) => f,
+            HandshakeError::Interrupted(_) => panic!("Bug: blocking handshake not blocked"),
+        })
+    }
+
+    fn create_request(parts: &Parts, uri: &Uri) -> Request {
+        let mut builder =
+            Request::builder().uri(uri.clone()).method(parts.method.clone()).version(parts.version);
+        *builder.headers_mut().expect("Failed to create `Request`") = parts.headers.clone();
+        builder.body(()).expect("Failed to create `Request`")
+    }
+
+    let (parts, _) = request.into_client_request()?.into_parts();
+    let mut uri = parts.uri.clone();
+
+    for attempt in 0..(max_redirects + 1) {
+        let request = create_request(&parts, &uri);
+
+        match try_client_handshake(request, &proxy, config) {
+            Err(Error::Http(res)) if res.status().is_redirection() && attempt < max_redirects => {
+                if let Some(location) = res.headers().get("Location") {
+                    uri = location.to_str()?.parse::<Uri>()?;
+                    debug!("Redirecting to {:?}", uri);
+                    continue;
+                } else {
+                    warn!("No `Location` found in redirect");
+                    return Err(Error::Http(res));
+                }
+            }
+            other => return other,
+        }
+    }
+
+    unreachable!("Bug in a redirect handling logic")
+}
+
 /// Connect to the given WebSocket in blocking mode.
 ///
 /// The URL may be either ws:// or wss://.
@@ -201,6 +331,28 @@ pub fn connect_with_config<Req: IntoClientRequest>(
 /// the `*-tls` features if you don't call `connect` since it's the only function that uses them.
 pub fn connect<Req: IntoClientRequest>(request: Req) -> Result<(WebSocket<AutoStream>, Response)> {
     connect_with_config(request, None, 3)
+}
+
+fn connect_to_proxy(
+    addrs: &[SocketAddr],
+    proxy: &SocketAddr,
+    uri: &Uri,
+    mode: Mode,
+) -> Result<encryption::ProxyAutoStream> {
+    let domain = uri.host().ok_or(Error::Url(UrlError::NoHostName))?;
+    let port = uri.port_u16().unwrap_or_else(|| match mode {
+        Mode::Plain => 80,
+        Mode::Tls => 443,
+    });
+    for addr in addrs {
+        debug!("Trying to contact {} at {}...", uri, addr);
+        if let Ok(sock_stream) = socks::Socks5Stream::connect(proxy, (domain, port)) {
+            if let Ok(stream) = encryption::wrap_proxy_stream(sock_stream, domain, mode) {
+                return Ok(stream);
+            }
+        }
+    }
+    Err(Error::Url(UrlError::UnableToConnect(uri.to_string())))
 }
 
 fn connect_to_some(addrs: &[SocketAddr], uri: &Uri, mode: Mode) -> Result<AutoStream> {
