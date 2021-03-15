@@ -168,6 +168,7 @@ mod encryption {
 
 use self::encryption::wrap_stream;
 pub use self::encryption::{AutoStream, ProxyAutoStream};
+pub use socks::Socks5Stream;
 
 use crate::{
     error::{Error, Result, UrlError},
