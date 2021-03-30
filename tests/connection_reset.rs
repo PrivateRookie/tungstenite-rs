@@ -3,25 +3,27 @@
 #![cfg(any(feature = "native-tls", feature = "rustls-tls"))]
 
 use std::{
-    net::{TcpListener, TcpStream},
+    net::TcpListener,
     process::exit,
     thread::{sleep, spawn},
     time::Duration,
 };
 
 use net2::TcpStreamExt;
-use tungstenite::{accept, connect, stream::Stream, Error, Message, WebSocket};
+use tungstenite::{
+    accept, client::AutoGenericStream, connect, stream::Stream, Error, Message, WebSocket,
+};
 use url::Url;
 
 #[cfg(feature = "native-tls")]
-type Sock = WebSocket<Stream<TcpStream, native_tls_crate::TlsStream<TcpStream>>>;
+type Sock = WebSocket<AutoGenericStream>;
 #[cfg(all(feature = "rustls-tls", not(feature = "native-tls")))]
-type Sock = WebSocket<Stream<TcpStream, rustls::StreamOwned<rustls::ClientSession, TcpStream>>>;
+type Sock = WebSocket<AutoGenericStream>;
 
 fn do_test<CT, ST>(port: u16, client_task: CT, server_task: ST)
 where
     CT: FnOnce(Sock) + Send + 'static,
-    ST: FnOnce(WebSocket<TcpStream>),
+    ST: FnOnce(WebSocket<AutoGenericStream>),
 {
     env_logger::try_init().ok();
 
@@ -41,8 +43,9 @@ where
         client_task(client);
     });
 
-    let client_handler = server.incoming().next().unwrap();
-    let client_handler = accept(client_handler.unwrap()).unwrap();
+    let client_handler =
+        AutoGenericStream::AutoStream(Stream::Plain(server.incoming().next().unwrap().unwrap()));
+    let client_handler = accept(client_handler).unwrap();
 
     server_task(client_handler);
 
@@ -110,7 +113,16 @@ fn test_evil_server_close() {
             let message = srv_sock.read_message().unwrap(); // receive acknowledgement
             assert!(message.is_close());
             // and now just drop the connection without waiting for `ConnectionClosed`
-            srv_sock.get_mut().set_linger(Some(Duration::from_secs(0))).unwrap();
+            if let AutoGenericStream::AutoStream(s) = srv_sock.get_mut() {
+                match s {
+                    Stream::Plain(s) => {
+                        s.set_linger(Some(Duration::from_secs(0))).unwrap();
+                    }
+                    Stream::Tls(s) => {
+                        s.get_mut().set_linger(Some(Duration::from_secs(0))).unwrap();
+                    }
+                }
+            }
             drop(srv_sock);
         },
     );

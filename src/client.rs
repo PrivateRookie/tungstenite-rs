@@ -177,6 +177,40 @@ use crate::{
     stream::{Mode, NoDelay},
 };
 
+/// wrapper of tcp stream and sock5 stream
+#[derive(Debug)]
+pub enum AutoGenericStream {
+    /// normal tcp stream
+    AutoStream(AutoStream),
+    /// proxy stream
+    ProxyAutoStream(ProxyAutoStream),
+}
+
+impl std::io::Read for AutoGenericStream {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        match self {
+            AutoGenericStream::AutoStream(s) => s.read(buf),
+            AutoGenericStream::ProxyAutoStream(s) => s.read(buf),
+        }
+    }
+}
+
+impl std::io::Write for AutoGenericStream {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        match self {
+            AutoGenericStream::AutoStream(s) => s.write(buf),
+            AutoGenericStream::ProxyAutoStream(s) => s.write(buf),
+        }
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        match self {
+            AutoGenericStream::AutoStream(s) => s.flush(),
+            AutoGenericStream::ProxyAutoStream(s) => s.flush(),
+        }
+    }
+}
+
 /// Connect to the given WebSocket in blocking mode.
 ///
 /// Uses a websocket configuration passed as an argument to the function. Calling it with `None` is
@@ -196,11 +230,13 @@ pub fn connect_with_config<Req: IntoClientRequest>(
     request: Req,
     config: Option<WebSocketConfig>,
     max_redirects: u8,
-) -> Result<(WebSocket<AutoStream>, Response)> {
+    proxy: Option<std::net::SocketAddr>,
+) -> Result<(WebSocket<AutoGenericStream>, Response)> {
     fn try_client_handshake(
         request: Request,
         config: Option<WebSocketConfig>,
-    ) -> Result<(WebSocket<AutoStream>, Response)> {
+        proxy: Option<std::net::SocketAddr>,
+    ) -> Result<(WebSocket<AutoGenericStream>, Response)> {
         let uri = request.uri();
         let mode = uri_mode(uri)?;
         let host = request.uri().host().ok_or(Error::Url(UrlError::NoHostName))?;
@@ -209,7 +245,16 @@ pub fn connect_with_config<Req: IntoClientRequest>(
             Mode::Tls => 443,
         });
         let addrs = (host, port).to_socket_addrs()?;
-        let mut stream = connect_to_some(addrs.as_slice(), &request.uri(), mode)?;
+        let mut stream = match proxy {
+            Some(proxy) => AutoGenericStream::ProxyAutoStream(connect_to_proxy(
+                addrs.as_slice(),
+                &proxy,
+                uri,
+                mode,
+            )?),
+            None => AutoGenericStream::AutoStream(connect_to_some(addrs.as_slice(), uri, mode)?),
+        };
+        // let mut stream = connect_to_some(addrs.as_slice(), &request.uri(), mode)?;
         NoDelay::set_nodelay(&mut stream, true)?;
         client_with_config(request, stream, config).map_err(|e| match e {
             HandshakeError::Failure(f) => f,
@@ -230,77 +275,7 @@ pub fn connect_with_config<Req: IntoClientRequest>(
     for attempt in 0..(max_redirects + 1) {
         let request = create_request(&parts, &uri);
 
-        match try_client_handshake(request, config) {
-            Err(Error::Http(res)) if res.status().is_redirection() && attempt < max_redirects => {
-                if let Some(location) = res.headers().get("Location") {
-                    uri = location.to_str()?.parse::<Uri>()?;
-                    debug!("Redirecting to {:?}", uri);
-                    continue;
-                } else {
-                    warn!("No `Location` found in redirect");
-                    return Err(Error::Http(res));
-                }
-            }
-            other => return other,
-        }
-    }
-
-    unreachable!("Bug in a redirect handling logic")
-}
-
-/// Connect to the given WebSocket in blocking mode via sock5 proxy.
-///
-/// The URL may be either ws:// or wss://.
-/// To support wss:// URLs, feature `native-tls` or `rustls-tls` must be turned on.
-///
-/// This function "just works" for those who wants a simple blocking solution
-/// similar to `std::net::TcpStream`. If you want a non-blocking or other
-/// custom stream, call `client` instead.
-///
-/// This function uses `native_tls` or `rustls` to do TLS depending on the feature flags enabled. If
-/// you want to use other TLS libraries, use `client` instead. There is no need to enable any of
-/// the `*-tls` features if you don't call `connect` since it's the only function that uses them.
-pub fn connect_with_proxy<Req: IntoClientRequest>(
-    request: Req,
-    proxy: std::net::SocketAddr,
-    config: Option<WebSocketConfig>,
-    max_redirects: u8,
-) -> Result<(WebSocket<encryption::ProxyAutoStream>, Response)> {
-    fn try_client_handshake(
-        request: Request,
-        proxy: &SocketAddr,
-        config: Option<WebSocketConfig>,
-    ) -> Result<(WebSocket<encryption::ProxyAutoStream>, Response)> {
-        let uri = request.uri();
-        let mode = uri_mode(uri)?;
-        let host = request.uri().host().ok_or(Error::Url(UrlError::NoHostName))?;
-        let port = request.uri().port_u16().unwrap_or_else(|| match mode {
-            Mode::Plain => 80,
-            Mode::Tls => 443,
-        });
-        let addrs = (host, port).to_socket_addrs()?;
-        let mut stream = connect_to_proxy(addrs.as_slice(), proxy, &request.uri(), mode)?;
-        NoDelay::set_nodelay(&mut stream, true)?;
-        client_with_config(request, stream, config).map_err(|e| match e {
-            HandshakeError::Failure(f) => f,
-            HandshakeError::Interrupted(_) => panic!("Bug: blocking handshake not blocked"),
-        })
-    }
-
-    fn create_request(parts: &Parts, uri: &Uri) -> Request {
-        let mut builder =
-            Request::builder().uri(uri.clone()).method(parts.method.clone()).version(parts.version);
-        *builder.headers_mut().expect("Failed to create `Request`") = parts.headers.clone();
-        builder.body(()).expect("Failed to create `Request`")
-    }
-
-    let (parts, _) = request.into_client_request()?.into_parts();
-    let mut uri = parts.uri.clone();
-
-    for attempt in 0..(max_redirects + 1) {
-        let request = create_request(&parts, &uri);
-
-        match try_client_handshake(request, &proxy, config) {
+        match try_client_handshake(request, config, proxy) {
             Err(Error::Http(res)) if res.status().is_redirection() && attempt < max_redirects => {
                 if let Some(location) = res.headers().get("Location") {
                     uri = location.to_str()?.parse::<Uri>()?;
@@ -330,8 +305,10 @@ pub fn connect_with_proxy<Req: IntoClientRequest>(
 /// This function uses `native_tls` or `rustls` to do TLS depending on the feature flags enabled. If
 /// you want to use other TLS libraries, use `client` instead. There is no need to enable any of
 /// the `*-tls` features if you don't call `connect` since it's the only function that uses them.
-pub fn connect<Req: IntoClientRequest>(request: Req) -> Result<(WebSocket<AutoStream>, Response)> {
-    connect_with_config(request, None, 3)
+pub fn connect<Req: IntoClientRequest>(
+    request: Req,
+) -> Result<(WebSocket<AutoGenericStream>, Response)> {
+    connect_with_config(request, None, 3, None)
 }
 
 fn connect_to_proxy(

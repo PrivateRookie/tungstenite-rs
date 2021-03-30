@@ -14,6 +14,8 @@ use native_tls_crate::TlsStream;
 use rustls::StreamOwned;
 use socks::Socks5Stream;
 
+use crate::client::AutoGenericStream;
+
 /// Stream mode, either plain TCP or TLS.
 #[derive(Clone, Copy, Debug)]
 pub enum Mode {
@@ -38,6 +40,15 @@ impl NoDelay for TcpStream {
 impl NoDelay for Socks5Stream {
     fn set_nodelay(&mut self, nodelay: bool) -> IoResult<()> {
         TcpStream::set_nodelay(self.get_mut(), nodelay)
+    }
+}
+
+impl NoDelay for AutoGenericStream {
+    fn set_nodelay(&mut self, nodelay: bool) -> IoResult<()> {
+        match self {
+            AutoGenericStream::AutoStream(s) => NoDelay::set_nodelay(s, nodelay),
+            AutoGenericStream::ProxyAutoStream(s) => NoDelay::set_nodelay(s, nodelay),
+        }
     }
 }
 
